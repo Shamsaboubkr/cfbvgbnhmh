@@ -1,0 +1,219 @@
+name: Build Windows MSI
+
+# Cloud build — no Visual Studio needed on your own PC.
+#
+# Runs automatically when the source changes, or on demand from the Actions tab
+# ("Run workflow"). The finished .msi and a portable .zip appear under
+# Artifacts on the run page; pushing a tag like v1.0.5 also attaches them to a
+# GitHub Release.
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+    paths-ignore:
+      - '**.apk'
+      - 'release/**'
+      - 'docs/**'
+      - '**.md'
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Skip flutter test (faster)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: '3.24.5'
+  APP_NAME: Bookspeaker
+
+jobs:
+  windows:
+    name: Build Windows app + MSI
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Optional path: if you uploaded the source bundle instead of pushing the
+      # whole project, this unpacks it in place. Harmless when the real source
+      # is already present.
+      - name: Unpack source bundle (if present)
+        shell: pwsh
+        run: |
+          if (Test-Path 'bookspeaker-src.tar.gz') {
+            Write-Host "Found source bundle - extracting"
+            tar -xzf bookspeaker-src.tar.gz
+          } else {
+            Write-Host "No bundle; using the checked-out source"
+          }
+
+      - name: Verify project layout
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'pubspec.yaml')) { throw "pubspec.yaml not found - wrong files in the repo" }
+          if (-not (Test-Path 'windows/runner/main.cpp')) { throw "windows/ platform folder missing" }
+          Write-Host "OK: project looks complete"
+
+      - name: Install Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Flutter doctor
+        run: flutter doctor -v
+
+      - name: Enable Windows desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Analyse
+        run: flutter analyze --no-pub
+        continue-on-error: true
+
+      # Note: the DB tests need sqlite3.dll, which is not guaranteed on a
+      # Windows runner. They must not block the MSI, so failures are logged
+      # rather than fatal.
+      - name: Run tests
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.skip_tests == false }}
+        continue-on-error: true
+        run: flutter test --no-pub
+
+      - name: Read version from pubspec
+        id: version
+        shell: pwsh
+        run: |
+          $line = Select-String -Path pubspec.yaml -Pattern '^version:\s*(.+)$' | Select-Object -First 1
+          $full = $line.Matches[0].Groups[1].Value.Trim()   # e.g. 1.0.5+6
+          $msiVersion = ($full -split '\+')[0]
+          if ($msiVersion -notmatch '^\d+\.\d+\.\d+$') { $msiVersion = "$msiVersion.0" }
+          Write-Host "pubspec version: $full  ->  MSI version: $msiVersion"
+          "full=$full" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "msi=$msiVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Build Windows release
+        run: flutter build windows --release
+
+      # Upload the runnable folder FIRST, so there is always something to
+      # download even if the WiX packaging below has a problem.
+      - name: Zip the built application
+        shell: pwsh
+        run: |
+          $src = 'build\windows\x64\runner\Release'
+          if (-not (Test-Path $src)) { throw "Build output not found at $src" }
+          $out = "build\${{ env.APP_NAME }}-windows-x64-portable.zip"
+          Compress-Archive -Path "$src\*" -DestinationPath $out -Force
+          Write-Host "Created $out ($([math]::Round((Get-Item $out).Length/1MB,1)) MB)"
+
+      - name: Upload portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: bookspeaker-windows-portable
+          path: build/Bookspeaker-windows-x64-portable.zip
+          if-no-files-found: error
+
+      # ---------------------------------------------------------------- MSI
+      - name: Install WiX Toolset 3.14
+        shell: pwsh
+        run: |
+          choco install wixtoolset --version=3.14.1 -y --no-progress
+          $wix = "${env:ProgramFiles(x86)}\WiX Toolset v3.14\bin"
+          if (-not (Test-Path $wix)) { $wix = "C:\Program Files (x86)\WiX Toolset v3.14\bin" }
+          if (-not (Test-Path $wix)) { throw "WiX bin folder not found" }
+          $wix | Out-File -FilePath $env:GITHUB_PATH -Append
+          Write-Host "WiX at $wix"
+
+      - name: Harvest build output into WiX components
+        shell: pwsh
+        working-directory: windows/installer
+        run: |
+          # heat.exe turns the whole Release folder (exe, DLLs, data/...) into
+          # WiX components so nothing is missed or hard-coded.
+          heat.exe dir "..\..\build\windows\x64\runner\Release" `
+            -cg AppFiles -gg -sfrag -srd -dr INSTALLFOLDER `
+            -var var.AppSource -out harvest.wxs
+          if (-not (Test-Path harvest.wxs)) { throw "heat.exe produced no output" }
+          Write-Host "harvested $((Select-String -Path harvest.wxs -Pattern '<File ' -AllMatches).Matches.Count) files"
+
+      - name: Compile and link the MSI
+        shell: pwsh
+        working-directory: windows/installer
+        run: |
+          $version = '${{ steps.version.outputs.msi }}'
+          candle.exe -arch x64 -dVersion=$version -dAppSource="..\..\build\windows\x64\runner\Release" Product.wxs harvest.wxs
+          if ($LASTEXITCODE -ne 0) { throw "candle.exe failed" }
+          light.exe -ext WixUIExtension -cultures:en-us -b "..\..\build\windows\x64\runner\Release" -out "${{ env.APP_NAME }}-${{ steps.version.outputs.full }}-x64.msi" Product.wixobj harvest.wixobj
+          if ($LASTEXITCODE -ne 0) { throw "light.exe failed" }
+          Get-ChildItem *.msi | Format-Table Name, Length
+
+      - name: Copy MSI to the artifact folder
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path build/msi | Out-Null
+          Copy-Item "windows/installer/*.msi" build/msi/
+          Get-ChildItem build/msi
+
+      # Some Windows machines lack the Visual C++ runtime Flutter needs.
+      # Shipping it alongside the MSI means you never have to hunt for it.
+      - name: Fetch Visual C++ redistributable (optional companion)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vc_redist.x64.exe' -OutFile 'build/msi/vc_redist.x64.exe'
+          Write-Host "fetched vc_redist.x64.exe"
+
+      - name: Upload MSI
+        uses: actions/upload-artifact@v4
+        with:
+          name: bookspeaker-windows-msi
+          path: build/msi/*
+          if-no-files-found: error
+
+      - name: Summary
+        if: always()
+        shell: pwsh
+        run: |
+          $lines = @()
+          $lines += "## Bookspeaker for Windows"
+          $lines += ""
+          $lines += "Version: ${{ steps.version.outputs.full }} (MSI ${{ steps.version.outputs.msi }})"
+          $lines += ""
+          Get-ChildItem build/msi -ErrorAction SilentlyContinue | ForEach-Object {
+            $lines += ("* MSI: ``" + $_.Name + "`` - " + [math]::Round($_.Length/1MB,1) + " MB")
+          }
+          Get-ChildItem build/*.zip -ErrorAction SilentlyContinue | ForEach-Object {
+            $lines += ("* Portable ZIP: ``" + $_.Name + "`` - " + [math]::Round($_.Length/1MB,1) + " MB")
+          }
+          $lines += ""
+          $lines += "Download both from the **Artifacts** section at the bottom of this page."
+          $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+  # Attaching to a Release when you push a tag like v1.0.5
+  release:
+    name: Attach to GitHub Release
+    needs: windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
+          body: |
+            Bookspeaker for Windows — download the `.msi` below and double-click it.
+            No admin rights needed; it installs just for your user account.
