@@ -14,7 +14,6 @@ on:
     paths-ignore:
       - '**.apk'
       - 'release/**'
-      - 'docs/**'
       - '**.md'
   workflow_dispatch:
     inputs:
@@ -42,12 +41,15 @@ jobs:
 
       # Optional path: if you uploaded the source bundle instead of pushing the
       # whole project, this unpacks it in place. Harmless when the real source
-      # is already present.
+      # is already present. ZIP and .tar.gz are both accepted.
       - name: Unpack source bundle (if present)
         shell: pwsh
         run: |
-          if (Test-Path 'bookspeaker-src.tar.gz') {
-            Write-Host "Found source bundle - extracting"
+          if (Test-Path 'bookspeaker-src.zip') {
+            Write-Host "Found bookspeaker-src.zip - extracting"
+            Expand-Archive -Path 'bookspeaker-src.zip' -DestinationPath '.' -Force
+          } elseif (Test-Path 'bookspeaker-src.tar.gz') {
+            Write-Host "Found bookspeaker-src.tar.gz - extracting"
             tar -xzf bookspeaker-src.tar.gz
           } else {
             Write-Host "No bundle; using the checked-out source"
@@ -56,8 +58,14 @@ jobs:
       - name: Verify project layout
         shell: pwsh
         run: |
-          if (-not (Test-Path 'pubspec.yaml')) { throw "pubspec.yaml not found - wrong files in the repo" }
-          if (-not (Test-Path 'windows/runner/main.cpp')) { throw "windows/ platform folder missing" }
+          $missing = @()
+          foreach ($p in @('pubspec.yaml', 'lib/main.dart', 'windows/CMakeLists.txt', 'windows/runner/main.cpp')) {
+            if (-not (Test-Path $p)) { $missing += $p }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Host "::error::Missing from the repo: $($missing -join ', ')"
+            throw "Project incomplete - upload the source bundle (bookspeaker-src.zip) or the full project"
+          }
           Write-Host "OK: project looks complete"
 
       - name: Install Flutter ${{ env.FLUTTER_VERSION }}
@@ -67,26 +75,63 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Enable Windows desktop + long paths
+        shell: pwsh
+        run: |
+          flutter config --enable-windows-desktop
+          git config --system core.longpaths true
+          Write-Host "desktop enabled, long paths on"
+
+      # ------------------------------------------------------------------
+      # THE FIX FOR THE FIRST FAILED RUN
+      #
+      # Flutter apps that use plugins need symlink support on Windows, which is
+      # only available with Developer Mode. On GitHub's runners Developer Mode
+      # is off, and `flutter build windows` dies with:
+      #   "Building with plugins requires symlink support.
+      #    Please enable Developer Mode in your system settings."
+      # This registry value is exactly what that setting toggles.
+      # ------------------------------------------------------------------
+      - name: Enable Developer Mode (symlink support for plugins)
+        shell: pwsh
+        run: |
+          $key = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock'
+          if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+          New-ItemProperty -Path $key -Name AllowDevelopmentWithoutDevLicense `
+            -PropertyType DWord -Value 1 -Force | Out-Null
+          Get-ItemProperty -Path $key | Select-Object AllowDevelopmentWithoutDevLicense | Format-List
+
       - name: Flutter doctor
         run: flutter doctor -v
-
-      - name: Enable Windows desktop
-        run: flutter config --enable-windows-desktop
 
       - name: Get dependencies
         run: flutter pub get
 
       - name: Analyse
-        run: flutter analyze --no-pub
         continue-on-error: true
+        run: flutter analyze --no-pub
 
-      # Note: the DB tests need sqlite3.dll, which is not guaranteed on a
-      # Windows runner. They must not block the MSI, so failures are logged
-      # rather than fatal.
+      # Tests need sqlite3.dll, which is not guaranteed on a Windows runner, and
+      # a couple of timing-sensitive assertions can flake on a cold VM. They are
+      # diagnostics here, never a gate: the MSI must not be blocked by them.
       - name: Run tests
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.skip_tests == false }}
         continue-on-error: true
-        run: flutter test --no-pub
+        shell: pwsh
+        run: |
+          flutter test --no-pub *>&1 | Tee-Object -FilePath test.log
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::Some tests failed - not blocking the build."
+            Add-Content $env:GITHUB_STEP_SUMMARY "`n### Failing tests (not blocking)`n"
+            $lines = Select-String -Path test.log -Pattern '\[E\]' | Select-Object -First 20
+            if ($lines.Count -eq 0) {
+              Add-Content $env:GITHUB_STEP_SUMMARY "```"
+              Get-Content test.log -Tail 25 | Add-Content $env:GITHUB_STEP_SUMMARY
+              Add-Content $env:GITHUB_STEP_SUMMARY "```"
+            } else {
+              $lines | ForEach-Object { Add-Content $env:GITHUB_STEP_SUMMARY ("* ``" + $_.Line.Trim() + "``") }
+            }
+          }
 
       - name: Read version from pubspec
         id: version
@@ -100,8 +145,23 @@ jobs:
           "full=$full" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "msi=$msiVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
+      # Output is captured to a file so that, if this fails, the reason lands in
+      # the run summary instead of disappearing into the log.
       - name: Build Windows release
-        run: flutter build windows --release
+        shell: pwsh
+        run: |
+          flutter build windows --release *>&1 | Tee-Object -FilePath build-windows.log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            Write-Host "::error::flutter build windows failed (exit $code)"
+            Add-Content $env:GITHUB_STEP_SUMMARY "`n### flutter build windows failed`n"
+            Add-Content $env:GITHUB_STEP_SUMMARY '```'
+            Get-Content build-windows.log -Tail 80 | Add-Content $env:GITHUB_STEP_SUMMARY
+            Add-Content $env:GITHUB_STEP_SUMMARY '```'
+            exit $code
+          }
+          Write-Host "build finished"
+          Get-ChildItem 'build\windows\x64\runner\Release' | Select-Object -First 10 Name
 
       # Upload the runnable folder FIRST, so there is always something to
       # download even if the WiX packaging below has a problem.
@@ -126,9 +186,17 @@ jobs:
         shell: pwsh
         run: |
           choco install wixtoolset --version=3.14.1 -y --no-progress
-          $wix = "${env:ProgramFiles(x86)}\WiX Toolset v3.14\bin"
-          if (-not (Test-Path $wix)) { $wix = "C:\Program Files (x86)\WiX Toolset v3.14\bin" }
-          if (-not (Test-Path $wix)) { throw "WiX bin folder not found" }
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\WiX Toolset v3.14\bin",
+            "$env:ProgramFiles\WiX Toolset v3.14\bin",
+            "C:\Program Files (x86)\WiX Toolset v3.14\bin"
+          )
+          $wix = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $wix) {
+            $found = Get-ChildItem 'C:\Program Files (x86)' -Filter 'WiX*' -Directory -ErrorAction SilentlyContinue
+            if ($found) { $wix = (Get-ChildItem $found[0].FullName -Filter 'candle.exe' -Recurse | Select-Object -First 1).DirectoryName }
+          }
+          if (-not $wix) { throw "WiX bin folder not found" }
           $wix | Out-File -FilePath $env:GITHUB_PATH -Append
           Write-Host "WiX at $wix"
 
@@ -142,16 +210,18 @@ jobs:
             -cg AppFiles -gg -sfrag -srd -dr INSTALLFOLDER `
             -var var.AppSource -out harvest.wxs
           if (-not (Test-Path harvest.wxs)) { throw "heat.exe produced no output" }
-          Write-Host "harvested $((Select-String -Path harvest.wxs -Pattern '<File ' -AllMatches).Matches.Count) files"
+          $count = (Select-String -Path harvest.wxs -Pattern '<File ' -AllMatches).Matches.Count
+          Write-Host "harvested $count files"
 
       - name: Compile and link the MSI
         shell: pwsh
         working-directory: windows/installer
         run: |
           $version = '${{ steps.version.outputs.msi }}'
+          $full    = '${{ steps.version.outputs.full }}'
           candle.exe -arch x64 -dVersion=$version -dAppSource="..\..\build\windows\x64\runner\Release" Product.wxs harvest.wxs
           if ($LASTEXITCODE -ne 0) { throw "candle.exe failed" }
-          light.exe -ext WixUIExtension -cultures:en-us -b "..\..\build\windows\x64\runner\Release" -out "${{ env.APP_NAME }}-${{ steps.version.outputs.full }}-x64.msi" Product.wixobj harvest.wixobj
+          light.exe -ext WixUIExtension -cultures:en-us -b "..\..\build\windows\x64\runner\Release" -out "${{ env.APP_NAME }}-$full-x64.msi" Product.wixobj harvest.wixobj
           if ($LASTEXITCODE -ne 0) { throw "light.exe failed" }
           Get-ChildItem *.msi | Format-Table Name, Length
 
@@ -163,13 +233,11 @@ jobs:
           Get-ChildItem build/msi
 
       # Some Windows machines lack the Visual C++ runtime Flutter needs.
-      # Shipping it alongside the MSI means you never have to hunt for it.
-      - name: Fetch Visual C++ redistributable (optional companion)
+      - name: Fetch Visual C++ redistributable (companion)
         shell: pwsh
         continue-on-error: true
         run: |
           Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vc_redist.x64.exe' -OutFile 'build/msi/vc_redist.x64.exe'
-          Write-Host "fetched vc_redist.x64.exe"
 
       - name: Upload MSI
         uses: actions/upload-artifact@v4
@@ -178,24 +246,36 @@ jobs:
           path: build/msi/*
           if-no-files-found: error
 
+      # Whatever happened, keep the logs so a failure can be diagnosed without
+      # asking for a re-run.
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build-windows.log
+            test.log
+          if-no-files-found: ignore
+
       - name: Summary
         if: always()
         shell: pwsh
         run: |
-          $lines = @()
-          $lines += "## Bookspeaker for Windows"
-          $lines += ""
-          $lines += "Version: ${{ steps.version.outputs.full }} (MSI ${{ steps.version.outputs.msi }})"
-          $lines += ""
+          Add-Content $env:GITHUB_STEP_SUMMARY "`n## Bookspeaker for Windows`n"
+          Add-Content $env:GITHUB_STEP_SUMMARY "Version ${{ steps.version.outputs.full }} (MSI ${{ steps.version.outputs.msi }})`n"
+          $any = $false
           Get-ChildItem build/msi -ErrorAction SilentlyContinue | ForEach-Object {
-            $lines += ("* MSI: ``" + $_.Name + "`` - " + [math]::Round($_.Length/1MB,1) + " MB")
+            Add-Content $env:GITHUB_STEP_SUMMARY ("* ``" + $_.Name + "`` - " + [math]::Round($_.Length/1MB,1) + " MB")
+            $any = $true
           }
           Get-ChildItem build/*.zip -ErrorAction SilentlyContinue | ForEach-Object {
-            $lines += ("* Portable ZIP: ``" + $_.Name + "`` - " + [math]::Round($_.Length/1MB,1) + " MB")
+            Add-Content $env:GITHUB_STEP_SUMMARY ("* ``" + $_.Name + "`` - " + [math]::Round($_.Length/1MB,1) + " MB")
+            $any = $true
           }
-          $lines += ""
-          $lines += "Download both from the **Artifacts** section at the bottom of this page."
-          $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          if (-not $any) {
+            Add-Content $env:GITHUB_STEP_SUMMARY "No installer produced this run - see the failing step above and the ``build-logs`` artifact."
+          }
 
   # Attaching to a Release when you push a tag like v1.0.5
   release:
